@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+
+
+source config
+
+
+TWITTER_CURL_HEADERS=(-H "User-Agent: $CURL_USERAGENT" -H 'Accept: */*' -H 'Accept-Language: en-GB,en;q=0.5' --compressed -H 'x-twitter-auth-type: OAuth2Session' -H 'x-twitter-client-language: en' -H 'x-twitter-active-user: yes' -H "x-csrf-token: $TWITTER_CSRF_TOKEN" -H 'DNT: 1' -H "authorization: Bearer $TWITTER_BEARER_AUTH" -H 'Connection: keep-alive' -H "Cookie: $TWITTER_COOKIES" -H 'Pragma: no-cache' -H 'Cache-Control: no-cache' -H 'TE: Trailers' -H 'Origin: https://twitter.com')
+
+
+mysql_exec(){
+	mysql -e "$1" twitter
+	if [ $? -gt 0 ]; then
+		echo "$1" >&2
+	fi
+}
+
+
+get_user_id(){
+	username="$1"
+	echo "get_user_id $username" >&2
+	user_id="$(curl -s 'https://tweeterid.com/ajax.php' -H "User-Agent: $CURL_USERAGENT" -H 'Accept: */*' -H 'Accept-Language: en-GB,en;q=0.5' --compressed -H 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' -H 'X-Requested-With: XMLHttpRequest' -H 'Origin: https://tweeterid.com' -H 'Connection: keep-alive' -H 'Referer: https://tweeterid.com/' -H 'DNT: 1' -H 'Pragma: no-cache' -H 'Cache-Control: no-cache' --data "input=$username")"
+	
+	echo "1st attempt: >>>$user_id<<<" >&2
+	
+	if [ "$user_id" = error ]; then
+		err=1
+	elif [ "$user_id" = "" ]; then
+		err=1
+	else
+		err=""
+	fi
+	if [ "$err" ]; then
+		user_id="$(curl -s "http://gettwitterid.com/?user_name=$username&submit=GET+USER+ID" -H "User-Agent: $CURL_USERAGENT" -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8' -H 'Accept-Language: en-GB,en;q=0.5' --compressed -H 'Connection: keep-alive' -H 'Referer: http://gettwitterid.com/' -H 'Upgrade-Insecure-Requests: 1' -H 'DNT: 1' -H 'Pragma: no-cache' -H 'Cache-Control: no-cache' | grep -A 3 '<p>Twitter User ID:</p>' | tail -n 1 | sed -E 's_</?p>__g')"
+		echo "2nd attempt: >>>$user_id<<<" >&2
+	fi
+	
+	if [ "$err" ]; then
+		if [ "$IGNORE_ERRORS" ]; then
+			echo "Failed" >&2
+		else
+			sleep 3600
+			echo "Tring again after 1hr" >&2
+			echo "$(get_user_id "$1")"
+		fi
+	fi
+	
+	# TODO: Can use the 2nd site to get more details: <p>Full Name:</p>, total followers
+	
+	echo "$user_id"
+}
+
+
+record_tweet_content_from_json(){
+	r="$2"
+	tweet_id="$1"
+	
+	read -r datetime < <(echo "$r" | jq '.globalObjects.tweets."'$tweet_id'" | .created_at')
+	read -r content  < <(echo "$r" | jq '.globalObjects.tweets."'$tweet_id'" | .full_text')
+	
+	mysql_exec "UPDATE post SET t=$(date -d "${datetime:1:-1}" +%s), text=$content WHERE id=$tweet_id"
+	
+	hashtags=""
+	hashtags2=""
+	while read -r hashtag; do
+		hashtags="$hashtags,$hashtag"
+		hashtags2="$hashtags2,($hashtag)"
+	done < <(echo "$r" | jq '.globalObjects.tweets."'$tweet_id'".entities.hashtags[] | .text' 2>/dev/null)
+	if [ "$hashtags" ]; then
+		mysql_exec "INSERT INTO hashtag (name) VALUES ${hashtags2:1} ON DUPLICATE KEY UPDATE id=id"
+		mysql_exec "INSERT INTO post2hashtag (post,hashtag) SELECT $tweet_id, id FROM hashtag WHERE name IN (${hashtags:1}) ON DUPlICATE KEY UPDATE post=post"
+	fi
+	
+	if [ "$(echo "$r" | jq '.globalObjects.tweets."'$tweet_id'".extended_entities.media[0].type' 2>/dev/null)" = '"video"' ]; then
+		is_video=1
+		max_bitrate=0
+		best_video_url=""
+		best_video_mimetype=""
+		while true; do
+			read mimetype
+			read url
+			read bitrate
+			if [ "$mimetype" = "" ]; then
+				break
+			fi
+			if [ "$bitrate" = null ]; then
+				bitrate=1
+			fi
+			if [ "$bitrate" -gt "$max_bitrate" ]; then
+				best_video_url="$(echo "$url" | sed -E 's/\?.*"$/"/g')"
+				best_video_mimetype="$mimetype"
+				max_bitrate="$bitrate"
+			fi
+		done < <(echo "$r" | jq '.globalObjects.tweets."'$tweet_id'".extended_entities.media[0].video_info.variants[] | .content_type, .url, .bitrate')
+		mysql_exec "INSERT INTO post2media (post,url) VALUES ($tweet_id,$best_video_url) ON DUPLICATE KEY UPDATE post=post"
+		if [ "$DL_TWEET_MEDIA" ]; then
+			wget -q --no-clobber -P "$TWITTER_MEDIA_DIR/vid" "${best_video_url:1:-1}"
+		else
+			echo "Not downloading video"
+		fi
+	else
+		is_video=""
+	fi
+	
+	while read -r url; do
+		mysql_exec "INSERT INTO post2link (post,url) VALUES ($tweet_id,$url) ON DUPlICATE KEY UPDATE post=post"
+	done < <(echo "$r" | jq '.globalObjects.tweets."'$tweet_id'".entities.urls[] | .expanded_url' 2>/dev/null)
+	
+	while read -r url; do
+		if [ "$is_video" = "" ]; then
+			if [ "${url:23:18}" = ext_tw_video_thumb ]; then
+				echo "Found video thumbnail but not video for post: $tweet_url" >&2
+				break
+			fi
+			mysql_exec "INSERT INTO post2media (post,url) VALUES ($tweet_id,$url) ON DUPlICATE KEY UPDATE post=post"
+			if [ "$DL_TWEET_MEDIA" ]; then
+				wget -q --no-clobber -P "$TWITTER_MEDIA_DIR/img" "${url:1:-1}"
+			else
+				echo "Not downloading image"
+			fi
+		else
+			mysql_exec "INSERT INTO post2media_preview (post,url) VALUES ($tweet_id,$url) ON DUPlICATE KEY UPDATE post=post"
+		fi
+	done < <(echo "$r" | jq '.globalObjects.tweets."'$tweet_id'".entities.media[] | .media_url_https' 2>/dev/null)
+}
+
+
+record_tweet_content(){
+	for tweet_url in "$@"; do
+		read -r username tweet_id < <(echo "$tweet_url" | sed -E 's_^https?://twitter[.]com/([^/]+)/status/([0-9]+)$_\1 \2_g')
+		
+		r="$(curl -s "https://api.twitter.com/2/timeline/conversation/${tweet_id}.json?include_profile_interstitial_type=1&include_blocking=1&include_blocked_by=1&include_followed_by=1&include_want_retweets=1&include_mute_edge=1&include_can_dm=1&include_can_media_tag=1&skip_status=1&cards_platform=Web-12&include_cards=1&include_ext_alt_text=true&include_reply_count=1&tweet_mode=extended&include_entities=true&include_user_entities=true&include_ext_media_color=true&include_ext_media_availability=true&send_error_codes=true&simple_quoted_tweet=true&count=20&ext=mediaStats%2ChighlightedLabel&include_quote_count=true" -H "Referer: https://twitter.com/${username}/status/${tweet_id}" "${TWITTER_CURL_HEADERS[@]}")"
+		
+		record_tweet_content_from_json "$tweet_id" "$r"
+		
+		tweet_id="$(echo "$r" | jq '.globalObjects.tweets."'$tweet_id'".retweeted_status_id_str')"
+		if [ "$tweet_id" = null ]; then
+			continue
+		fi
+		tweet_id="${tweet_id:1:-1}"
+		
+		user_id="$(echo "$r" | jq '.globalObjects.tweets."'$tweet_id'".user_id_str')"
+		user_id="${user_id:1:-1}"
+		username="$(echo "$r" | jq '.globalObjects.users."'${user_id}'".screen_name')"
+		
+		echo "Inserting $user_id, $username"
+		
+		mysql_exec "INSERT INTO user (id,name,full_name,t,n_followers,n_friends,private,verified,nsfw) VALUES ($user_id, '$username', '', 0, 0, 0, 0, 0, 0) ON DUPLICATE KEY UPDATE id=id"
+		mysql_exec "INSERT INTO post (id,user,t,text) VALUES ($tweet_id,$user_id,0,'') ON DUPLICATE KEY UPDATE id=id"
+		record_tweet_content_from_json "$tweet_id" "$r"
+	done
+}
+
+
+record_twitter_post(){
+	read -r username tweet_id < <(echo "$1" | sed -E 's_^https?://twitter[.]com/([^/]+)/status/([0-9]+)$_\1 \2_g')
+	
+	json_fp=/tmp/twitter-likes.json
+	
+	if [ "$2" ]; then
+		user_id="$2"
+	else
+		user_id="$(get_user_id "$username")"
+		if [ "$user_id" = "" ]; then
+			return
+		fi
+		mysql_exec "INSERT INTO user (id,name,full_name,t,n_followers,n_friends,private,verified,nsfw) VALUES ($user_id, '$username', '', 0, 0, 0, 0, 0, 0) ON DUPLICATE KEY UPDATE id=id"
+		echo "Recorded user" >&2
+	fi
+	
+	curl -s "https://api.twitter.com/2/timeline/liked_by.json?include_profile_interstitial_type=1&include_blocking=1&include_blocked_by=1&include_followed_by=1&include_want_retweets=1&include_mute_edge=1&include_can_dm=1&include_can_media_tag=1&skip_status=1&cards_platform=Web-12&include_cards=1&include_composer_source=true&include_ext_alt_text=true&include_reply_count=1&tweet_mode=extended&include_entities=true&include_user_entities=true&include_ext_media_color=true&include_ext_media_availability=true&send_error_codes=true&simple_quoted_tweets=true&tweet_id=$tweet_id&count=80&ext=mediaStats%2ChighlightedLabel%2CcameraMoment" -H 'Origin: https://twitter.com' -H "Referer: https://twitter.com/$username" "${TWITTER_CURL_HEADERS[@]}" > "$json_fp"
+	
+	err_code="$(cat "$json_fp" | jq .errors[0].code)"
+	if [ "$err_code" = null ]; then
+		dummy=1
+	elif [ "$err_code" = 131 ]; then
+		dummy=1
+	else
+		echo "$(date): ERROR[$err_code]: Probably rate limit" >&2
+		sleep 600 # If error exists, probably rate limit
+	fi
+	
+	if [ "$3" ]; then
+		dumy=1
+	else
+		mysql_exec "INSERT INTO post (id,user,t,text) VALUES ($tweet_id,$user_id,0,'') ON DUPLICATE KEY UPDATE id=id"
+		echo "Recorded post" >&2
+	fi
+	
+	python3 record-post.py "$tweet_id" "$DB_USERNAME" "$json_fp"
+	
+	record_tweet_content "$1" # WARNING: This apparently modifies the tweet_id value of this scope...
+}

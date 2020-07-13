@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+
+if [ $# -eq 0 ]; then
+	echo "$0 [USERNAME] [USERTAG1~~~USERTAG2~~~...~~~USERTAGN] [DL_MEDIA ? TRUE or FALSE]" >&2
+fi
+
+
+mysql -e "INSERT INTO jobstr (username, usertags, dl_media) VALUES ($(dblqt "$2"), $(dblqt "$3"), $4)" twitter

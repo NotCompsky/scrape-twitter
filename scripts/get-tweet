@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+
+source utils
+
+
+if [ $# -eq 0 ]; then
+	echo "[DL_TWEET_MEDIA=1]? $0 [[URLS]]" >&2
+	exit
+fi
+
+
+for url in "$@"; do
+	record_twitter_post "$url"
+done
